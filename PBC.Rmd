@@ -1,0 +1,243 @@
+---
+title: "Deep pseudo"
+output: html_document
+date: 
+---
+```{r}
+library(reticulate)
+```
+
+```{python}
+import keras
+import tensorflow as tf
+from tensorflow.python.keras.layers import Input, Dense
+from keras.models import Model, load_model
+import pandas as pd
+import numpy as np
+```
+
+```{r}
+library(tensorflow)
+getOption("max.print")
+#rm(list=ls())
+library(keras)
+library(pseudo)
+library(survivalROC)
+library(survival)
+library(survcomp)
+library(survAUC)
+library(reticulate)
+library(torch)
+library(data.table)
+library(tidyverse)
+library(reticulate)
+library(tensorflow)
+library(keras)
+library(coxphw)
+library(Hmisc)
+library(SemiCompRisks)
+library(rms)
+```
+
+
+```{r}
+getPseudoConditional <- function(t, d, qt){
+  #browser()
+  s <- c(0, qt)  
+  n=length(t)
+  ns=length(s)-1  # the number of intervals
+  D <- do.call(cbind, lapply(1:ns, function(j)  (s[j] < t) * (t <= s[j+1]) * (d == 1)))
+  R <- do.call(cbind, lapply(1:ns, function(j) ifelse(s[j] < t, 1, 0)))
+  Delta<-do.call(cbind, lapply(1:ns, function(j) pmin(t,s[j+1])-s[j]))
+  
+  
+  # format into long formate
+  dd.tmp=cbind.data.frame(id=rep(1:n,ns),s=rep(c(0,qt[-length(qt)]), each=n), y=c(R*Delta),d=c(D))
+  
+  dd=dd.tmp[dd.tmp$y>0,]
+  pseudost=rep(NA, nrow(dd))
+  for (j in 1:ns){
+    index= (dd$s==s[j])
+    dds=dd[index,]
+    pseudost[index]=pseudosurv(time=dds$y, event=dds$d, tmax=s[j+1]-s[j])$pseudo
+    print(j)
+  }
+  dd$pseudost=pseudost  
+  return(dd[,c(1,2,5)])
+}
+
+```
+
+#----------------------------------------------------------------------------------------
+# Another example of a neural network with one hidden layer implemented in R keras in the paper
+#-----------------------------------------------------------------------------------------
+pseudoDNN.train <- function(x_train, y_train){
+  
+  model <- keras_model_sequential() %>%
+    layer_dense(units = 64, kernel_regularizer = regularizer_l2(0.0001), activation = "relu",
+                input_shape = dim(x_train)[[2]]) %>%
+    layer_dense(units = 32, kernel_regularizer = regularizer_l2(0.01),
+                activation = "relu") %>%
+        layer_dense(units = 16, kernel_regularizer = regularizer_l2(0.01),
+                activation = "relu") %>%
+    layer_dense(units = 8, kernel_regularizer = regularizer_l2(0.01),
+                activation = "relu") %>%
+    layer_dense(units = 1, activation='sigmoid')
+  
+  model %>% compile(
+    optimizer =optimizer_adamax(learning_rate = 0.0025),
+    loss = "mse",
+    metrics = c("mae")
+  )
+  model %>% fit(x_train, y_train,
+                epochs = 1000, batch_size = 64,
+                verbose = 0)
+  
+  model
+}
+#----------------------------------------------------------------------------
+#prediction based on a keras model
+#----------------------------------------------------------------------------
+pseudoDNN.predict <- function(model, x_test){
+  ypred <- model %>% predict(x_test)
+  }
+
+```
+
+```{r}
+Deep = list()
+CoxM =list()
+for (i  in 1:10) {
+data("pbc", package = "survival")
+head(pbc)[, c(1:5, 11, 12)]
+head(pbcseq)[, c(1, 4:5, 7, 12, 13)]
+pbc <- pbc %>% mutate(bili = log(bili), protime = log(protime),alk.phos)
+pbcseq <- pbcseq %>% mutate(bili = log(bili), protime = log(protime),alk.phos=log(alk.phos))
+
+temp <- subset(pbc, id <= 312, select = c(id:sex)) # baseline
+pbc2 <- tmerge(temp, temp, id = id, death = event(time, status)) #set range
+pbc2 <- tmerge(pbc2, pbcseq, id = id, bili = tdc(day, bili),
+               protime = tdc(day, protime), alk.phos=tdc(day,alk.phos))
+pbc2<-pbc2%>%  mutate( time_period= case_when(tstop >= 1  & tstop <= 2000 ~ '1',
+                                    tstop >= 2001  & tstop <= 2440 ~ '2',
+                                    tstop >= 2441  ~ '3'))
+
+rf_data_melt<- pivot_longer(pbc2, c(bili,protime,alk.phos),names_to = "variable", values_to = "value")
+head(rf_data_melt)
+
+dodge <- position_dodge(width = 0.4)
+options(repr.plot.width=13, repr.plot.height=8)
+ggplot((rf_data_melt %>% filter( variable == "bili"|variable == "protime"|variable=="alk.phos") %>% drop_na()),
+       aes(x=factor(time_period),y=value,fill=variable))+geom_boxplot()+labs( x = "Time period")
+
+# Split the data into train and test 
+pbc2$status<-ifelse(pbc2$status==2, 1, 0)
+split<-split(pbc2, f = pbc2$id>=200) 
+
+train <-split$`FALSE`
+test <-split$`TRUE`
+
+# Response 
+surv_train <- train$tstop
+cen_train <- train$status
+
+surv_test <- test$tstop
+cen_test <- test$status
+
+fitpbc <- cph(Surv(tstart, tstop, status) ~protime+bili+age+sex+trt+alk.phos, train, x=T, y=T)
+#summary(fitpbc)
+valfitpbc<-validate(fitpbc,method="boot", B=20,dxy=TRUE, data=test)
+
+
+# covariates
+
+x_train<- train[,c(4,5,6,10,11,12)]
+
+x_test<-test[,c(4,5,6,10,11,12)]
+x_train_cont<-x_train[,c(2,4,5,6)]
+x_test_cont<-x_test[,c(2,4,5,6)]
+## Normalise data
+min_max_norm <- function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}
+
+x_train_norm<-min_max_norm(as.matrix(x_train_cont))
+x_test_norm<-min_max_norm(as.matrix(x_test_cont))
+
+pickTime<-c(2000, 2440,3880)
+x_train<-cbind(x_train_norm,x_train[,c(1,3)])
+x_test<-cbind(x_test_norm,x_test[,c(1,3)])
+pseudo <- pseudosurv(time=surv_train,event=cen_train,tmax=pickTime)
+
+btrain <- NULL
+for(it in 1:length(pseudo$time)){
+  btrain <- rbind(btrain,cbind(train,pseudo = pseudo$pseudo[,it],
+                               tpseudo = pseudo$time[it],id=1:nrow(train)))
+}
+
+train <- btrain
+
+
+# create dummy variables for the time points
+smatrix=model.matrix(~as.factor(train$tpseudo)+0)
+x_train<-cbind(x_train_norm,x_train[,c(1,3)])
+#create input predictors 
+x_train.all <- cbind(x_train, smatrix,row.names = NULL)
+x_train.all <-data.frame(x_train.all)
+x_train.all<-data.matrix(x_train.all)
+x_train.all<-as.data.frame(x_train.all)
+x_train.all<-data.matrix(x_train.all, rownames.force = NULL)
+x_train.all<-x_train.all
+x_train.all[,6]<-as.numeric(x_train.all[,6])
+x_train.all<-as.matrix(x_train.all)
+# The outcome variable
+y_train.all <- train$pseudo
+
+# Train the model
+
+model = pseudoDNN.train(x_train.all, y_train.all)
+
+# Predict 
+
+
+#x_test<-as.data.frame(lapply(x_test, min_max_norm))
+x_test<-cbind(x_test_norm,x_test[,c(1,3)])
+x_test.all=do.call(rbind, replicate(length(pickTime), as.matrix(x_test), simplify=FALSE))
+x_test.all<-as.data.frame(x_test.all)
+s_test=rep(pickTime,each=nrow(x_test))
+s_test<-as.numeric(s_test)
+smatrix.test=model.matrix(~as.factor(s_test)+0)
+x_test.all=cbind(x_test.all,smatrix.test)
+x_test.all <-data.frame(x_test.all)
+x_test.all<-data.matrix(x_test.all)
+#x_test.all<-as.numeric(x_test.all)
+#x_test.all$sex<-as.numeric(x_test.all$sex)
+
+
+ypred.con <- pseudoDNN.predict(model, x_test.all)
+
+
+
+# obtain the marginal survival probability by multiple series of conditional probabilities
+ypred.con <- matrix(ypred.con, nrow=nrow(x_test))
+ypred <- lapply(1:length(pickTime), function(i) apply(ypred.con[,1:i, drop=FALSE], 1, prod))
+surv_prob <- Reduce(cbind, ypred)
+head(surv_prob)
+nrow(surv_prob)
+max(surv_prob)
+min(surv_prob)
+c_i<-concordance.index(x=1-surv_prob[,1], surv.time=surv_test, surv.event=cen_test, method="noether")$c.index
+valfitpbc<-(valfitpbc[[1,3]])/2+0.5 
+Deep<-c(Deep, c_i)
+CoxM<-c(CoxM,valfitpbc)
+}
+
+Results<-data.frame(unlist(Deep), unlist(CoxM))
+boxplot(Results)
+write.csv(Results,file="PBC_results.csv")
+Data<-data.frame(surv_prob)
+write.csv(Data, file="PBC_surv_prob.csv")
+```
+
+
+

@@ -1,0 +1,206 @@
+---
+title: "Deep pseudo"
+output: html_document
+date: 
+---
+
+```{python}
+
+import keras
+import tensorflow as tf
+from tensorflow.python.keras.layers import Input, Dense
+from keras.models import Model, load_model
+import pandas as pd
+import numpy as np
+```
+
+```{r}
+library(tensorflow)
+getOption("max.print")
+#rm(list=ls())
+library(keras)
+library(pseudo)
+library(survivalROC)
+library(survival)
+library(survcomp)
+library(survAUC)
+library(reticulate)
+library(torch)
+library(data.table)
+library(tidyverse)
+library(reticulate)
+library(tensorflow)
+library(keras)
+library(coxphw)
+library(Hmisc)
+library(SemiCompRisks)
+library(rms)
+```
+
+```{r}
+getPseudoConditional <- function(t, d, qt){
+  #browser()
+  s <- c(0, qt)  
+  n=length(t)
+  ns=length(s)-1  # the number of intervals
+  D <- do.call(cbind, lapply(1:ns, function(j)  (s[j] < t) * (t <= s[j+1]) * (d == 1)))
+  R <- do.call(cbind, lapply(1:ns, function(j) ifelse(s[j] < t, 1, 0)))
+  Delta<-do.call(cbind, lapply(1:ns, function(j) pmin(t,s[j+1])-s[j]))
+  
+  
+  # format into long formate
+  dd.tmp=cbind.data.frame(id=rep(1:n,ns),s=rep(c(0,qt[-length(qt)]), each=n), y=c(R*Delta),d=c(D))
+  
+  dd=dd.tmp[dd.tmp$y>0,]
+  pseudost=rep(NA, nrow(dd))
+  for (j in 1:ns){
+    index= (dd$s==s[j])
+    dds=dd[index,]
+    pseudost[index]=pseudosurv(time=dds$y, event=dds$d, tmax=s[j+1]-s[j])$pseudo
+    print(j)
+  }
+  dd$pseudost=pseudost  
+  return(dd[,c(1,2,5)])
+}
+
+```
+
+```{r}
+
+library(tensorflow)
+#----------------------------------------------------------------------------------------
+# Another example of a neural network with one hidden layer implemented in R keras in the paper
+#-----------------------------------------------------------------------------------------
+pseudoDNN.train <- function(x_train, y_train){
+  model <- keras_model_sequential() %>%
+    layer_dense(units=16,  activation = "relu",bias_initializer = initializer_constant(0.0),
+                input_shape = dim(x_train)[[2]]) %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(units = 1, activation='relu')
+  
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    loss = "mean_squared_error",
+    metrics = c("mae")
+  )
+  model %>% fit(x_train, y_train,validation_split = 0.2,
+                epochs = 1000, batch_size =256,
+                verbose = 0)
+  model
+  
+}
+
+
+#----------------------------------------------------------------------------
+#prediction based on a keras model
+#----------------------------------------------------------------------------
+pseudoDNN.predict <- function(model, x_test){
+  ypred <- model %>% predict(x_test)
+  
+}
+
+```
+
+```{r}
+
+## Real dataset application 
+## Real dataset I 
+Deep = list()
+CoxM =list()
+for (i  in 1:10) {
+data(BMT, package = "SemiCompRisks")
+  BMT <- rowid_to_column(BMT, "my_id")
+   
+td_dat <- 
+  tmerge(data1 = BMT %>% dplyr::select(my_id, T1, delta1), data2 = BMT %>% dplyr::select(my_id, T1, delta1, TA, deltaA,TP,TC, g), 
+         id = my_id, death = event(T1, delta1),agvhd = tdc(TA),cgvhd=tdc(TC),precovery=tdc(TP))
+
+
+# Split the data into train and test 
+
+split<-split(td_dat, f = td_dat$my_id>=110) 
+pickTime<-c(40,100,300,500)
+train <-split$`FALSE`
+test <-split$`TRUE`
+test
+# Response 
+surv_train <- train$tstop
+cen_train <- train$death
+
+surv_test <- test$tstop
+cen_test <- test$death
+
+## Cox model 
+fitbmt <- cph(Surv(tstart, tstop, death) ~agvhd+cgvhd+precovery, train, x=T, y=T)
+valfitbmt<-validate(fitbmt,method="boot", B=20,dxy=TRUE, data=test)
+
+## Pseudo values 
+
+qt<-c(4, 1000, 2000)
+pseudo <- pseudosurv(time=surv_train,event=cen_train,tmax=qt)
+
+btrain <- NULL
+for(it in 1:length(pseudo$time)){
+  btrain <- rbind(btrain,cbind(train,pseudo = pseudo$pseudo[,it],
+                               tpseudo = pseudo$time[it],id=1:nrow(train)))
+}
+
+train <- btrain
+# covariates
+
+x_train<- as.matrix(train[,c(7,8,9)])
+
+x_test<-as.matrix(test[,c(7,8,9)])
+
+# create dummy variables for the time points
+smatrix=model.matrix(~as.factor(train$tpseudo)+0)
+
+#create input predictors 
+x_train.all <- cbind(x_train, smatrix)
+x_train.all<-as.matrix(x_train.all)
+dim(x_train.all)
+# The outcome variable
+y_train.all <- train$pseudo
+y_train.all
+x_train.all
+
+# Train the model
+
+model = pseudoDNN.train(x_train.all, y_train.all)
+
+# Predict 
+
+
+#x_test<-as.data.frame(lapply(x_test, min_max_norm))
+x_test.all=do.call(rbind, replicate(length(qt), as.matrix(x_test), simplify=FALSE))
+s_test=rep(qt,each=nrow(x_test))
+smatrix.test=model.matrix(~as.factor(s_test)+0)
+x_test.all=cbind(x_test.all,smatrix.test)
+
+
+ypred.con <- pseudoDNN.predict(model, x_test.all)
+
+# obtain the marginal survival probability by multiple series of conditional probabilities
+ypred.con <- matrix(ypred.con, nrow=nrow(x_test))
+ypred <- lapply(1:length(qt), function(i) apply(ypred.con[,1:i, drop=FALSE], 1, prod))
+surv_prob <- Reduce(cbind, ypred)
+head(surv_prob)
+nrow(surv_prob)
+max(surv_prob)
+min(surv_prob)
+c_i=concordance.index(x=1-surv_prob[,1], surv.time=surv_test, surv.event=cen_test, method="noether")$c.index
+valfitbmt<-(valfitbmt[[1,3]])/2+0.5 
+Deep<-c(Deep, c_i)
+CoxM<-c(CoxM,valfitbmt)
+}
+
+Results<-data.frame(unlist(Deep), unlist(CoxM))
+boxplot(Results)
+write.csv(Results,file="BMT_results.csv")
+Data<-data.frame(surv_prob)
+write.csv(Data, file="BMT_surv_prob.csv")
+
+```
+
+
+
